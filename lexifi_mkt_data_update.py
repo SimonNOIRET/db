@@ -14,8 +14,8 @@ URL = "https://market-data.client.lexifi.com/market_data/lsmoM122/"
 USERNAME = "federal_finance"
 PASSWORD = "tadJz8BPGf6N"
 DEST_DIR = r"C:\Users\Simon\Documents\ArkeaAM\VSCode\lexifi_mkt_data"
-CHECKSUM_FILE = os.path.join(DEST_DIR, "checksums.json")
 
+CHECKSUM_FILE = os.path.join(DEST_DIR, "checksums.json")
 os.makedirs(DEST_DIR, exist_ok=True)
 
 def extract_md_lines_from_zip(zip_content):
@@ -49,7 +49,6 @@ def get_remote_file_list(session):
         if href.endswith(".zip"):
             zip_filename = os.path.basename(href)
 
-            # 🔽 Ignore lexifi_market_data.zip sans date
             if re.fullmatch(r"lexifi_market_data\.zip", zip_filename):
                 continue
 
@@ -87,7 +86,6 @@ def main():
         for zip_filename, full_url in tqdm(zip_links, desc="Téléchargement", unit="fichier"):
             csv_path = os.path.join(DEST_DIR, zip_filename.replace(".zip", ".csv"))
 
-            # ⏩ Skip si déjà traité
             if zip_filename in checksums and os.path.exists(csv_path):
                 unchanged_files.append(zip_filename)
                 continue
@@ -107,7 +105,6 @@ def main():
 
                     new_checksum = lines_checksum(md_lines)
 
-                    # Comparaison avec fichier local (si présent)
                     if os.path.exists(csv_path):
                         with open(csv_path, "r", encoding="utf-8") as f:
                             existing_lines = [line.strip() for line in f.readlines()]
@@ -136,7 +133,6 @@ def main():
 
     save_checksums(checksums)
 
-    # Résumé
     print("\n📊 Résumé :")
     print(f"✅ Fichiers mis à jour : {len(updated_files)}")
     print(f"↪️ Fichiers inchangés : {len(unchanged_files)}")

@@ -1,19 +1,31 @@
 import os
 import pandas as pd
 import pyodbc
-from datetime import datetime, date
+from datetime import datetime
 import warnings
+import time
 
 warnings.simplefilter(action='ignore', category=pd.errors.DtypeWarning)
 
 folder = r'C:\Users\Simon\Documents\ArkeaAM\VSCode\lexifi_mkt_data'
 db_path = r'C:\Users\Simon\Documents\ArkeaAM\VSCode\lexifi_mkt_data.accdb'
 
-conn_str = (
-    r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
-    fr'DBQ={db_path};'
-)
-conn = pyodbc.connect(conn_str)
+table_name = "asset_spot"
+fields = {
+    "id": "lexifi_id",
+    "spot": "lexifi_spot",
+    "date": "lexifi_date"
+}
+BATCH_SIZE = 500
+
+def get_connection():
+    conn_str = (
+        r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
+        fr'DBQ={db_path};'
+    )
+    return pyodbc.connect(conn_str)
+
+conn = get_connection()
 cursor = conn.cursor()
 
 csv_files = sorted(
@@ -21,28 +33,29 @@ csv_files = sorted(
     reverse=True
 )
 
-print(f"🔍 {len(csv_files)} fichier(s) trouvé(s). Traitement en cours...\n")
+total_files = len(csv_files)
+print(f"\n🔍 {total_files} fichier(s) trouvé(s). Traitement en cours...\n")
+start_global = time.time()
 
 print("📥 Chargement des données existantes depuis la base...")
-existing_rows = set()
-for row in cursor.execute("SELECT lexifi_id, lexifi_spot, lexifi_date FROM asset_spot"):
-    try:
-        lexifi_id = str(row[0])
-        spot_value = float(row[1])
-        spot_rounded = round(spot_value, 4)
-        spot_str = f"{spot_rounded:.4f}"
 
-        lexifi_date = row[2]
-        if isinstance(lexifi_date, datetime):
-            lexifi_date = lexifi_date.date() 
+query = f"SELECT {fields['id']}, {fields['spot']}, {fields['date']} FROM {table_name}"
+existing_df = pd.read_sql(query, conn)
 
-        key = (lexifi_id, spot_str, lexifi_date)
-        existing_rows.add(key)
-    except Exception as e:
-        print(f"⚠️ Ligne ignorée (corrompue ou non décodable) : {row} → {e}")
+existing_df[fields['id']] = existing_df[fields['id']].astype(str).str.strip()
+existing_df[fields['spot']] = existing_df[fields['spot']].astype(float).round(4)
+existing_df[fields['date']] = pd.to_datetime(existing_df[fields['date']]).dt.date
+
+existing_rows = set(existing_df.itertuples(index=False, name=None))
 print(f"✅ {len(existing_rows)} enregistrements déjà présents.\n")
+print("=" * 60)
+
+processed_files = 0
 
 for filename in csv_files:
+    file_start = time.time()
+    processed_files += 1
+
     filepath = os.path.join(folder, filename)
 
     try:
@@ -52,57 +65,57 @@ for filename in csv_files:
         print(f"⚠️ Nom de fichier invalide, ignoré : {filename}")
         continue
 
-    print(f"📄 Traitement de {filename} (date: {lexifi_date})...")
+    print(f"📄 [{processed_files}/{total_files}] Traitement de `{filename}` (Date: {lexifi_date})...")
 
     try:
-        df = pd.read_csv(filepath, header=None, on_bad_lines='skip', low_memory=False)
+        df = pd.read_csv(filepath, header=None, on_bad_lines='skip', dtype={1: str, 2: str})
     except Exception as e:
-        print(f"❌ Erreur de lecture de {filename} : {e}\n")
+        print(f"❌ Erreur de lecture de `{filename}` : {e}\n")
         continue
 
     df_spot = df[df[0] == "Asset_spot"].copy()
     if df_spot.empty:
-        print("ℹ️  Aucun 'Asset_spot' trouvé, fichier ignoré.\n")
+        print("ℹ️ Aucun 'Asset_spot' trouvé, fichier ignoré.\n")
         continue
 
-    df_spot["date"] = lexifi_date
-    rows_to_insert = []
+    df_spot.rename(columns={1: fields['id'], 2: fields['spot']}, inplace=True)
+    df_spot[fields['spot']] = pd.to_numeric(df_spot[fields['spot']], errors='coerce').round(4)
+    df_spot[fields['date']] = lexifi_date
 
-    for _, row in df_spot.iterrows():
-        try:
-            lexifi_id = str(row[1]).strip()
-            spot_value = row[2]
+    df_spot[fields['id']] = df_spot[fields['id']].astype(str).str.strip()
+    new_rows = [
+        (row[fields['id']], row[fields['spot']], row[fields['date']])
+        for _, row in df_spot.iterrows()
+        if (row[fields['id']], row[fields['spot']], row[fields['date']]) not in existing_rows
+    ]
 
-            if isinstance(spot_value, bytes):
-                spot_value = spot_value.decode("utf-8", errors="ignore").strip()
+    if not new_rows:
+        print(f"✅ Aucune nouvelle donnée à insérer pour `{filename}`.\n")
+        continue
 
-            lexifi_spot = round(float(spot_value), 4)
-            spot_str = f"{lexifi_spot:.4f}"
-
-            lexifi_date = row["date"]
-            if isinstance(lexifi_date, datetime):
-                lexifi_date = lexifi_date.date()
-
-            key = (lexifi_id, spot_str, lexifi_date)
-            if key not in existing_rows:
-                rows_to_insert.append((lexifi_id, lexifi_spot, lexifi_date))
-                existing_rows.add(key)
-        except Exception as conv_err:
-            print(f"  ⚠️ Ligne ignorée (erreur de conversion) : {conv_err}")
-            continue
-
-    for row in rows_to_insert:
-        try:
-            cursor.execute("""
-                INSERT INTO asset_spot (lexifi_id, lexifi_spot, lexifi_date)
+    try:
+        for i in range(0, len(new_rows), BATCH_SIZE):
+            batch = new_rows[i:i + BATCH_SIZE]
+            cursor.executemany(f"""
+                INSERT INTO {table_name} ({fields['id']}, {fields['spot']}, {fields['date']})
                 VALUES (?, ?, ?)
-            """, row)
-        except Exception as insert_err:
-            print(f"  ❌ Erreur d'insertion pour {row[0]} : {insert_err}")
+            """, batch)
+            conn.commit()
+        print(f"✅ {len(new_rows)} ligne(s) ajoutée(s) depuis `{filename}`.")
 
-    conn.commit()
-    print(f"✅ {len(rows_to_insert)} ligne(s) ajoutée(s) depuis {filename}.\n")
+        existing_rows.update(new_rows)
+
+    except Exception as insert_err:
+        print(f"❌ Erreur d'insertion pour `{filename}` : {insert_err}")
+        conn.rollback()
+
+    file_end = time.time()
+    print(f"⏱️ Temps de traitement : {file_end - file_start:.2f} secondes.\n")
+    print("=" * 60)
 
 cursor.close()
 conn.close()
-print("🎉 Traitement terminé pour tous les fichiers.")
+
+end_global = time.time()
+print(f"🎉 Traitement terminé pour tous les fichiers en {end_global - start_global:.2f} secondes.")
+print(f"📊 {processed_files}/{total_files} fichiers traités.")
