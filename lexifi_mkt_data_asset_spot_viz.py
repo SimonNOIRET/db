@@ -1,51 +1,55 @@
 import streamlit as st
 import pandas as pd
-import pyodbc
 import plotly.express as px
 from io import BytesIO
+from sqlalchemy import create_engine
 
-ACCESS_DB_PATH = r"C:\Users\Simon\Documents\ArkeaAM\VSCode\lexifi_mkt_data.accdb"
+# Configuration PostgreSQL
+DB_USER = "postgres"
+DB_PASSWORD = "0112"
+DB_HOST = "localhost"
+DB_PORT = "5432"
+DB_NAME = "lexifi_mkt_data"
+
 TABLE_NAME = "asset_spot"
 ID_COL = "lexifi_id"
 DATE_COL = "lexifi_date"
 VALUE_COL = "lexifi_spot"
 
+# Fonction de connexion SQLAlchemy (non cachée car non sérialisable)
+def get_engine():
+    engine_str = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    return create_engine(engine_str)
+
+# Récupération des identifiants disponibles
 @st.cache_data
 def connect_and_fetch_ids():
-    conn_str = (
-        r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
-        f'DBQ={ACCESS_DB_PATH};'
-    )
-    conn = pyodbc.connect(conn_str)
-    df = pd.read_sql(f"SELECT DISTINCT {ID_COL} FROM {TABLE_NAME}", conn)
-    conn.close()
+    engine = get_engine()
+    df = pd.read_sql(f"SELECT DISTINCT {ID_COL} FROM {TABLE_NAME}", con=engine)
     return df[ID_COL].dropna().astype(str).tolist()
 
+# Récupération des données pour un ID
 @st.cache_data
 def fetch_data_for_id(selected_id):
-    conn_str = (
-        r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
-        f'DBQ={ACCESS_DB_PATH};'
-    )
-    conn = pyodbc.connect(conn_str)
+    engine = get_engine()
     query = f"""
         SELECT {DATE_COL}, {VALUE_COL}
         FROM {TABLE_NAME}
-        WHERE {ID_COL} = ?
+        WHERE {ID_COL} = %s
         ORDER BY {DATE_COL}
     """
-    df = pd.read_sql(query, conn, params=[selected_id])
-    conn.close()
+    df = pd.read_sql(query, con=engine, params=(selected_id,))
     df[DATE_COL] = pd.to_datetime(df[DATE_COL])
     df["id"] = selected_id
     return df
 
+# UI Streamlit
 st.set_page_config(page_title="Données de marché", layout="wide")
 st.title("📈 Visualisation des données 'asset spot'")
-st.caption("Source: LexiFi")
+st.caption("Source: LexiFi (via PostgreSQL)")
 
 id_list = connect_and_fetch_ids()
-selected_ids = st.multiselect("Sélectionner un ou plusieurs IDs :", id_list, key="id_selector")
+selected_ids = st.multiselect("Sélectionner un ou plusieurs IDs :", id_list)
 
 if selected_ids:
     all_data = []
@@ -109,118 +113,110 @@ if selected_ids:
                     plot_df = filtered_df.reset_index().melt(id_vars=DATE_COL, var_name="ID", value_name="Valeur")
                     chart_title = f"Données pour l'identifiant : {selected_ids[0]} à partir du {start_date}"
 
-                if plot_df.empty:
-                    st.warning("⚠️ Données introuvables pour cette configuration.")
-                else:
-                    fig = px.line(
-                        plot_df,
-                        x=DATE_COL,
-                        y="Valeur",
-                        color="ID",
-                        title=chart_title,
-                    )
+                fig = px.line(
+                    plot_df,
+                    x=DATE_COL,
+                    y="Valeur",
+                    color="ID",
+                    title=chart_title,
+                )
 
-                    fig.update_traces(
-                        line=dict(width=1),
-                        marker=dict(size=4),
-                        mode="lines+markers"
-                    )
+                fig.update_traces(line=dict(width=1), marker=dict(size=4), mode="lines+markers")
+                fig.update_layout(
+                    xaxis_title="Date",
+                    yaxis_title="Valeur",
+                    hovermode="x unified",
+                    height=800,
+                    width=900,
+                    legend=dict(orientation="v", x=1.02, y=1, xanchor="left")
+                )
 
-                    fig.update_layout(
-                        xaxis_title="Date",
-                        yaxis_title="Valeur",
-                        hovermode="x unified",
-                        height=800,
-                        width=900,
-                        legend=dict(orientation="v", x=1.02, y=1, xanchor="left")
-                    )
+                st.plotly_chart(fig, use_container_width=True)
 
-                    st.plotly_chart(fig, use_container_width=True)
+                raw_plot_df = filtered_df.reset_index().melt(id_vars=DATE_COL, var_name="ID", value_name="Valeur")
+                csv_buffer = BytesIO()
+                export_df = raw_plot_df.rename(columns={DATE_COL: "Date"})
+                export_df.to_csv(csv_buffer, index=False)
+                st.download_button(
+                    label="📁 Télécharger les données affichées en CSV",
+                    data=csv_buffer.getvalue(),
+                    file_name="donnees_visualisation.csv",
+                    mime="text/csv"
+                )
 
-                    raw_plot_df = filtered_df.reset_index().melt(id_vars=DATE_COL, var_name="ID", value_name="Valeur")
-                    csv_buffer = BytesIO()
-                    export_df = raw_plot_df.rename(columns={DATE_COL: "Date"})
-                    export_df.to_csv(csv_buffer, index=False)
-                    st.download_button(
-                        label="📁 Télécharger les données affichées en CSV",
-                        data=csv_buffer.getvalue(),
-                        file_name="donnees_visualisation.csv",
-                        mime="text/csv"
-                    )
+                st.subheader("📊 Statistiques des séries sélectionnées")
+                stats_df = filtered_df.copy()
+                last_date = stats_df.index.max()
+                start_year = pd.to_datetime(start_date).year
+                end_year = last_date.year
+                years = list(range(start_year, end_year + 1))
+                stats_summary = []
 
-                    st.subheader("📊 Statistiques des séries sélectionnées")
-                    stats_df = filtered_df.copy()
-                    last_date = stats_df.index.max()
-                    start_year = pd.to_datetime(start_date).year
-                    end_year = last_date.year
-                    years = list(range(start_year, end_year + 1))
-                    stats_summary = []
+                for col in stats_df.columns:
+                    serie = stats_df[col].dropna()
+                    if serie.empty:
+                        continue
 
-                    for col in stats_df.columns:
-                        serie = stats_df[col].dropna()
-                        if serie.empty:
-                            continue
+                    val_current = serie.iloc[-1]
+                    val_min = serie.min()
+                    val_max = serie.max()
 
-                        val_current = serie.iloc[-1]
-                        val_min = serie.min()
-                        val_max = serie.max()
-
-                        perf_by_year = {}
-                        for year in years:
-                            dec_31 = pd.Timestamp(f"{year-1}-12-31")
-                            end_of_year_data = serie[serie.index.year == year]
-                            if not end_of_year_data.empty:
-                                try:
-                                    start_val = serie[serie.index <= dec_31].iloc[-1]
-                                    end_val = end_of_year_data.iloc[-1]
-                                    perf = (end_val / start_val - 1) * 100
-                                    perf_by_year[f"Perf {year}"] = perf
-                                except:
-                                    perf_by_year[f"Perf {year}"] = None
-                            else:
-                                perf_by_year[f"Perf {year}"] = None
-
-                        dec_31_last_year = pd.Timestamp(f"{last_date.year - 1}-12-31")
-                        try:
-                            ytd_start_val = serie[serie.index <= dec_31_last_year].iloc[-1]
-                            perf_ytd = (val_current / ytd_start_val - 1) * 100
-                        except:
-                            perf_ytd = None
-
-                        stats_summary.append({
-                            "ID": col,
-                            "Valeur actuelle": val_current,
-                            "Min": val_min,
-                            "Max": val_max,
-                            **perf_by_year,
-                            "Perf YTD": perf_ytd
-                        })
-
-                    stats_table = pd.DataFrame(stats_summary)
-
-                    def format_number(x):
-                        return f"{x:,.2f}".replace(",", " ").replace(".00", ".00")
-
-                    def format_percent(x):
-                        return f"{x:.2f} %" if pd.notna(x) else "-"
-
-                    format_dict = {
-                        "Valeur actuelle": format_number,
-                        "Min": format_number,
-                        "Max": format_number,
-                        "Perf YTD": format_percent
-                    }
+                    perf_by_year = {}
                     for year in years:
-                        format_dict[f"Perf {year}"] = format_percent
+                        dec_31 = pd.Timestamp(f"{year-1}-12-31")
+                        end_of_year_data = serie[serie.index.year == year]
+                        if not end_of_year_data.empty:
+                            try:
+                                start_val = serie[serie.index <= dec_31].iloc[-1]
+                                end_val = end_of_year_data.iloc[-1]
+                                perf = (end_val / start_val - 1) * 100
+                                perf_by_year[f"Perf {year}"] = perf
+                            except:
+                                perf_by_year[f"Perf {year}"] = None
+                        else:
+                            perf_by_year[f"Perf {year}"] = None
 
-                    stats_table = stats_table.sort_values(by="Perf YTD", ascending=False)
-                    st.dataframe(
-                        stats_table.style.format(format_dict).set_properties(**{'text-align': 'left'}),
-                        use_container_width=True
-                    )
+                    dec_31_last_year = pd.Timestamp(f"{last_date.year - 1}-12-31")
+                    try:
+                        ytd_start_val = serie[serie.index <= dec_31_last_year].iloc[-1]
+                        perf_ytd = (val_current / ytd_start_val - 1) * 100
+                    except:
+                        perf_ytd = None
+
+                    stats_summary.append({
+                        "ID": col,
+                        "Valeur actuelle": val_current,
+                        "Min": val_min,
+                        "Max": val_max,
+                        **perf_by_year,
+                        "Perf YTD": perf_ytd
+                    })
+
+                stats_table = pd.DataFrame(stats_summary)
+
+                def format_number(x):
+                    return f"{x:,.2f}".replace(",", " ").replace(".00", ".00")
+
+                def format_percent(x):
+                    return f"{x:.2f} %" if pd.notna(x) else "-"
+
+                format_dict = {
+                    "Valeur actuelle": format_number,
+                    "Min": format_number,
+                    "Max": format_number,
+                    "Perf YTD": format_percent
+                }
+                for year in years:
+                    format_dict[f"Perf {year}"] = format_percent
+
+                stats_table = stats_table.sort_values(by="Perf YTD", ascending=False)
+                st.dataframe(
+                    stats_table.style.format(format_dict).set_properties(**{'text-align': 'left'}),
+                    use_container_width=True
+                )
 
             except Exception as e:
                 st.error(f"❌ Erreur lors de l'affichage : {e}")
 
 st.markdown("---")
-st.markdown(f"📁 **Base utilisée** : `{ACCESS_DB_PATH}`")
+st.markdown(f"🧩 **Base PostgreSQL utilisée** : `{DB_NAME}` sur `{DB_HOST}:{DB_PORT}`")
