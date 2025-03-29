@@ -1,10 +1,14 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 from io import BytesIO
 from sqlalchemy import create_engine
 
-# Configuration PostgreSQL
+# Pour que le navigateur s’ouvre automatiquement, lancer avec :
+# streamlit run app.py --browser.gatherUsageStats false
+# ou configurer ~/.streamlit/config.toml avec serverHeadless = false
+
 DB_USER = "postgres"
 DB_PASSWORD = "0112"
 DB_HOST = "localhost"
@@ -16,19 +20,16 @@ ID_COL = "lexifi_id"
 DATE_COL = "lexifi_date"
 VALUE_COL = "lexifi_spot"
 
-# Fonction de connexion SQLAlchemy (non cachée car non sérialisable)
 def get_engine():
     engine_str = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     return create_engine(engine_str)
 
-# Récupération des identifiants disponibles
 @st.cache_data
 def connect_and_fetch_ids():
     engine = get_engine()
     df = pd.read_sql(f"SELECT DISTINCT {ID_COL} FROM {TABLE_NAME}", con=engine)
     return df[ID_COL].dropna().astype(str).tolist()
 
-# Récupération des données pour un ID
 @st.cache_data
 def fetch_data_for_id(selected_id):
     engine = get_engine()
@@ -43,10 +44,9 @@ def fetch_data_for_id(selected_id):
     df["id"] = selected_id
     return df
 
-# UI Streamlit
-st.set_page_config(page_title="Données de marché", layout="wide")
-st.title("📈 Visualisation des données 'asset spot'")
-st.caption("Source: LexiFi (via PostgreSQL)")
+st.set_page_config(page_title="Arkea Asset Management", layout="wide")
+st.title("📈 Market Data Overwatch")
+st.caption("Source: LexiFi")
 
 id_list = connect_and_fetch_ids()
 selected_ids = st.multiselect("Sélectionner un ou plusieurs IDs :", id_list)
@@ -111,7 +111,7 @@ if selected_ids:
                     chart_title = f"Séries rebasées à 100 à partir du {start_date}"
                 else:
                     plot_df = filtered_df.reset_index().melt(id_vars=DATE_COL, var_name="ID", value_name="Valeur")
-                    chart_title = f"Données pour l'identifiant : {selected_ids[0]} à partir du {start_date}"
+                    chart_title = f"Données pour l'id : {selected_ids[0]} à partir du {start_date}"
 
                 fig = px.line(
                     plot_df,
@@ -161,6 +161,10 @@ if selected_ids:
                     val_min = serie.min()
                     val_max = serie.max()
 
+                    # ✅ Rendements et volatilité
+                    returns = serie.pct_change().dropna()
+                    vol_annuelle = returns.std() * np.sqrt(252)
+
                     perf_by_year = {}
                     for year in years:
                         dec_31 = pd.Timestamp(f"{year-1}-12-31")
@@ -189,7 +193,8 @@ if selected_ids:
                         "Min": val_min,
                         "Max": val_max,
                         **perf_by_year,
-                        "Perf YTD": perf_ytd
+                        "Perf YTD": perf_ytd,
+                        "Volatilité réalisée (%)": vol_annuelle * 100
                     })
 
                 stats_table = pd.DataFrame(stats_summary)
@@ -204,19 +209,31 @@ if selected_ids:
                     "Valeur actuelle": format_number,
                     "Min": format_number,
                     "Max": format_number,
-                    "Perf YTD": format_percent
+                    "Perf YTD": format_percent,
+                    "Volatilité réalisée (%)": format_percent
                 }
                 for year in years:
                     format_dict[f"Perf {year}"] = format_percent
 
                 stats_table = stats_table.sort_values(by="Perf YTD", ascending=False)
+
                 st.dataframe(
-                    stats_table.style.format(format_dict).set_properties(**{'text-align': 'left'}),
+                    stats_table.style
+                        .format(format_dict)
+                        .applymap(lambda x: 'text-align: left', subset=["ID"])
+                        .set_properties(**{'text-align': 'center'})
+                        .set_properties(subset=["ID"], **{'text-align': 'left'}),
                     use_container_width=True
                 )
 
             except Exception as e:
                 st.error(f"❌ Erreur lors de l'affichage : {e}")
 
+# ✅ Signature
+st.markdown(
+    "<div style='text-align: right; font-size: 0.9em; color: gray;'>Simon NOIRET - Arkea Asset Management</div>",
+    unsafe_allow_html=True
+)
+
 st.markdown("---")
-st.markdown(f"🧩 **Base PostgreSQL utilisée** : `{DB_NAME}` sur `{DB_HOST}:{DB_PORT}`")
+st.markdown(f"🧩 **Base PostgreSQL utilisée** : {DB_NAME} sur {DB_HOST}:{DB_PORT}")
