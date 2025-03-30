@@ -70,11 +70,11 @@ def fetch_forward_ids():
 # ----------------------- PAGE CONFIG -----------------------
 st.set_page_config(
     page_title="Arkea Asset Management",
-    page_icon="C:/Users/Simon/Documents/ArkeaAM/VSCode/logo/AAM_icon.png",
+    page_icon="C:/Users/Simon/Documents/ArkeaAM/VSCode/icons/AAM_1.png",
     layout="wide"
 )
 
-st.title("🔍 Market Data Overwatch")
+st.title("🔍 Market Data Overwatch 🔍")
 st.caption("Source: LexiFi")
 
 asset_name_map = fetch_asset_mapping()
@@ -82,7 +82,7 @@ id_list = connect_and_fetch_ids()
 display_list = [f"{id_} - {asset_name_map.get(id_, 'Inconnu')}" for id_ in id_list]
 id_display_map = dict(zip(display_list, id_list))
 
-tab_labels = ["Spot", "Forward"]
+tab_labels = ["📈 Spot", "📈 Forward"]
 tabs = st.tabs(tab_labels)
 
 # ----------------------- ONGLET SPOT -----------------------
@@ -146,7 +146,7 @@ with tabs[0]:
                     plot_df = filtered_df.reset_index().melt(id_vars=DATE_COL, var_name="lexifi_id", value_name="Valeur")
 
                 plot_df["Asset"] = plot_df["lexifi_id"].map(asset_name_map).fillna(plot_df["lexifi_id"])
-                chart_title = f"Séries rebasées à 100 à partir du {start_date}" if len(selected_ids) > 1 else f"Évolution de {plot_df['Asset'].iloc[0]}"
+                chart_title = f"Séries rebasées à 100 à partir du {start_date}" if len(selected_ids) > 1 else f"Évolution historique de l'actif : {plot_df['Asset'].iloc[0]}"
 
                 fig = px.line(
                     plot_df,
@@ -262,7 +262,7 @@ with tabs[1]:
     forward_display_map = dict(zip(forward_ids_df["display"], forward_ids_df[FORWARD_ID]))
     forward_baseid_map = dict(zip(forward_ids_df[FORWARD_ID], forward_ids_df[FORWARD_BASE_ID]))
 
-    selected_display = st.multiselect("Sélectionner un ou plusieurs forwards :", forward_display_map.keys())
+    selected_display = st.multiselect("Sélectionner un ou plusieurs IDs :", forward_display_map.keys())
     selected_forward_ids = [forward_display_map[d] for d in selected_display]
     selected_base_ids = list(set(forward_baseid_map[fid] for fid in selected_forward_ids))
 
@@ -399,7 +399,7 @@ with tabs[1]:
             term_df,
             x="Tenor",
             y=FORWARD_VALUE,
-            title=f"Structure par terme - {asset_name_map.get(default_asset_id, default_asset_id)} - {selected_term_date}"
+            title=f"Structure par terme • {asset_name_map.get(default_asset_id, default_asset_id)} • {selected_term_date}"
         )
         fig_term.update_layout(
             height=500,
@@ -412,8 +412,57 @@ with tabs[1]:
     else:
         st.info("Veuillez d'abord sélectionner un ou plusieurs forwards au-dessus pour activer la structure par terme.")
 
+    # ----- PENTES RELATIVES -----
+    try:
+        forward_series = term_df.set_index("Tenor_num")[FORWARD_VALUE]
+
+        tenors = sorted(forward_series.index.tolist())
+        rel_matrix = pd.DataFrame(index=tenors, columns=tenors, dtype=float)
+
+        for i in tenors:
+            for j in tenors:
+                if forward_series[i] != 0:
+                    rel_matrix.loc[i, j] = ((forward_series[j] / forward_series[i]) - 1) * 100
+                else:
+                    rel_matrix.loc[i, j] = None
+
+        rel_matrix.index = [f"{i}Y" for i in rel_matrix.index]
+        rel_matrix.columns = [f"{j}Y" for j in rel_matrix.columns]
+
+        import plotly.figure_factory as ff
+
+        z = rel_matrix.values
+        x = rel_matrix.columns.tolist()
+        y = rel_matrix.index.tolist()
+
+        fig_rel_heatmap = ff.create_annotated_heatmap(
+            z,
+            x=x,
+            y=y,
+            colorscale="RdBu",
+            showscale=True,
+            reversescale=True,
+            zmin=-np.nanmax(np.abs(z)),
+            zmax=np.nanmax(np.abs(z)),
+            annotation_text=[[f"{v:.2f}%" if pd.notna(v) else "" for v in row] for row in z],
+            hoverinfo="z"
+        )
+
+        fig_rel_heatmap.update_layout(
+            title=f"Matrice des pentes relatives • Fwd(j) / Fwd(i) - 1 • {asset_name_map.get(default_asset_id, default_asset_id)}",
+            xaxis_title="Tenor(j)",
+            yaxis_title="Tenor(i)",
+            height=600,
+            margin=dict(l=60, r=60, t=80, b=40)
+        )
+
+        st.plotly_chart(fig_rel_heatmap, use_container_width=True)
+
+    except Exception as e:
+        st.warning(f"Erreur lors de la génération de la matrice des pentes relatives : {e}")
+
 # ----------------------- FOOTER -----------------------
-with open("C:/Users/Simon/Documents/ArkeaAM/VSCode/logo/AAM_full.png", "rb") as f:
+with open("C:/Users/Simon/Documents/ArkeaAM/VSCode/icons/AAM_2.png", "rb") as f:
     img_bytes = f.read()
     encoded = base64.b64encode(img_bytes).decode()
 
