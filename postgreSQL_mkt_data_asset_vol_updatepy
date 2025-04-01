@@ -1,0 +1,205 @@
+import os
+import time
+import pandas as pd
+import numpy as np
+import psycopg2
+from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor
+from scipy.interpolate import SmoothBivariateSpline
+import warnings
+
+warnings.simplefilter(action='ignore', category=pd.errors.DtypeWarning)
+
+FOLDER = r'C:\Users\Simon\Documents\ArkeaAM\VSCode\lexifi_mkt_data'
+TABLE_NAME = "asset_volatility"
+
+FIELDS = {
+    "lexifi_vol_id": "lexifi_vol_id",
+    "lexifi_id": "lexifi_id",
+    "lexifi_vol": "lexifi_vol",
+    "lexifi_date": "lexifi_date"
+}
+
+TARGET_TENORS = list(range(1, 11))  # 1Y to 10Y
+TARGET_STRIKES = list(range(40, 170, 10))  # 40% to 160%
+BATCH_SIZE = 500
+VACUUM_EVERY = 100
+MAX_VOL_VALUE = 10.0
+MIN_VOL_VALUE = 0.01
+
+
+def interpolate_vol_surface(tenors, strikes, vols, target_tenors, target_strikes):
+    try:
+        tenors = np.array(tenors)
+        strikes = np.array(strikes)
+        vols = np.array(vols)
+
+        if len(vols) < 5:
+            return []
+
+        # Clamp input vols to remove extreme outliers
+        vols = np.clip(vols, MIN_VOL_VALUE, MAX_VOL_VALUE)
+
+        spline = SmoothBivariateSpline(tenors, strikes, vols, s=0.01)
+        result = []
+        for t in target_tenors:
+            for k in target_strikes:
+                vol = float(spline(t, k)[0])
+                # Handle edge case if interpolated value is invalid
+                if np.isnan(vol) or vol < 0:
+                    vol = np.median(vols)  # fallback to median of inputs
+                vol = max(min(vol, MAX_VOL_VALUE), MIN_VOL_VALUE)
+                result.append((t, k, vol))
+        return result
+    except:
+        return []
+
+
+def interpolate_asset_vol(args):
+    isin, points, date = args
+    if len(points) < 5:
+        return []
+
+    points.sort()
+    tenors, strikes, vols = zip(*points)
+    interpolated = interpolate_vol_surface(tenors, strikes, vols, TARGET_TENORS, TARGET_STRIKES)
+
+    return [
+        (f"{isin} {t}Y {int(k)}%", isin, float(round(v, 6)), date)
+        for t, k, v in interpolated
+    ]
+
+
+if __name__ == '__main__':
+    conn = psycopg2.connect(
+        host="localhost",
+        port="5432",
+        database="lexifi_mkt_data",
+        user="postgres",
+        password="0112"
+    )
+    conn.autocommit = False
+    cursor = conn.cursor()
+
+    cursor.execute(f"SELECT DISTINCT {FIELDS['lexifi_date']} FROM {TABLE_NAME};")
+    already_in_db = {row[0] for row in cursor.fetchall()}
+
+    csv_files = sorted(
+        [f for f in os.listdir(FOLDER) if f.startswith("lexifi_market_data_") and f.endswith(".csv")],
+        reverse=True
+    )
+
+    print(f"🔍 {len(csv_files)} fichier(s) trouvé(s). Début du traitement...\n")
+
+    file_count = 0
+    total_start_time = time.time()
+
+    for filename in csv_files:
+        file_start_time = time.time()
+        file_count += 1
+        filepath = os.path.join(FOLDER, filename)
+
+        try:
+            file_date = datetime.strptime(filename.replace("lexifi_market_data_", "").replace(".csv", ""), "%Y-%m-%d").date()
+        except ValueError:
+            print(f"⚠️ [{file_count}/{len(csv_files)}] Nom de fichier invalide : {filename}")
+            continue
+
+        if file_date in already_in_db:
+            print(f"⏩ [{file_count}/{len(csv_files)}] Fichier déjà traité : {filename}")
+            continue
+
+        print(f"📄 [{file_count}/{len(csv_files)}] Traitement de {filename}...")
+
+        try:
+            df = pd.read_csv(filepath, header=None, on_bad_lines='skip', low_memory=False)
+            df = df[df[0] == "Asset_volatility"].copy()
+        except Exception:
+            print(f"❌ Erreur lecture fichier : {filename}")
+            continue
+
+        df[3] = pd.to_datetime(df[3], format="%Y-%m-%d", errors='coerce')
+        df = df[df[3].notna()].copy()
+
+        df['lexifi_date'] = df[3]
+
+        def parse_vol_info(s):
+            parts = str(s).split()
+            if len(parts) < 3:
+                return None, None, None
+            try:
+                isin = parts[0].strip()
+                maturity = pd.to_datetime(parts[1], format="%Y-%m-%d", errors='coerce')
+                strike_raw = parts[2].strip()
+                if not strike_raw.endswith('%'):
+                    return None, None, None
+                strike = float(strike_raw.rstrip('%'))
+                return isin, maturity, strike
+            except:
+                return None, None, None
+
+        df[['isin', 'maturity_date', 'strike']] = df[1].apply(lambda x: pd.Series(parse_vol_info(x)))
+        df = df[df['isin'].notna() & df['maturity_date'].notna() & df['strike'].notna()].copy()
+        df['tenor_years'] = (df['maturity_date'] - df['lexifi_date']).dt.days / 365.0
+        df = df[df['tenor_years'] > 0]
+
+        df['value'] = pd.to_numeric(df[2], errors='coerce')
+        df = df[df['value'].notna()]
+
+        grouped = df.groupby(['isin', 'lexifi_date'])
+        args_list = [
+            (isin, list(zip(group['tenor_years'], group['strike'], group['value'])), date)
+            for (isin, date), group in grouped
+        ]
+
+        rows_to_upsert = []
+        with ProcessPoolExecutor(max_workers=16) as executor:
+            results = executor.map(interpolate_asset_vol, args_list)
+            for rows in results:
+                if rows:
+                    rows_to_upsert.extend(rows)
+
+        try:
+            upsert_query = f"""
+                INSERT INTO {TABLE_NAME}
+                ({FIELDS['lexifi_vol_id']}, {FIELDS['lexifi_id']}, {FIELDS['lexifi_vol']}, {FIELDS['lexifi_date']})
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT ({FIELDS['lexifi_vol_id']}, {FIELDS['lexifi_date']})
+                DO UPDATE SET
+                    {FIELDS['lexifi_id']} = EXCLUDED.{FIELDS['lexifi_id']},
+                    {FIELDS['lexifi_vol']} = EXCLUDED.{FIELDS['lexifi_vol']};
+            """
+            for i in range(0, len(rows_to_upsert), BATCH_SIZE):
+                cursor.executemany(upsert_query, rows_to_upsert[i:i + BATCH_SIZE])
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"⚠️ Erreur UPSERT : {e}")
+            continue
+
+        if file_count % VACUUM_EVERY == 0:
+            print("🧼 VACUUM ANALYZE en cours...")
+            try:
+                conn.commit()
+                conn.autocommit = True
+                cursor.execute(f"VACUUM ANALYZE {TABLE_NAME};")
+                conn.autocommit = False
+                print("✅ VACUUM terminé.")
+            except Exception as e:
+                print(f"⚠️ Erreur VACUUM : {e}")
+
+        file_end_time = time.time()
+        print(f"✅ [{file_count}/{len(csv_files)}] {len(rows_to_upsert)} ligne(s) traitée(s) en {file_end_time - file_start_time:.2f} sec.\n")
+        time.sleep(0.2)
+
+    cursor.close()
+    conn.close()
+    total_elapsed_time = time.time() - total_start_time
+    print(f"🎉 Traitement terminé en {total_elapsed_time:.2f} secondes pour {file_count} fichier(s).")
+
+
+
+
+
+
+

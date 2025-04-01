@@ -157,7 +157,7 @@ if __name__ == '__main__':
             grouped = df_type.groupby(['isin', 3])
             args_list = [ (isin, list(zip(group['maturity_years'], group['value'])), date) for (isin, date), group in grouped ]
 
-            with ProcessPoolExecutor(max_workers=20) as executor:
+            with ProcessPoolExecutor(max_workers=16) as executor:
                 results = executor.map(interpolate_asset, args_list)
                 for rows in results:
                     if rows:
